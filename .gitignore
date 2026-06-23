@@ -1,0 +1,4 @@
+node_modules/
+*.tgz
+AGENTS.md
+CLAUDE.md
