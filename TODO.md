@@ -1,0 +1,760 @@
+# TODO
+
+Actionable task list for `fried-apple-pie`. Self-contained: each task lists rationale, exact files/lines, implementation sketch, Pi-API references, and acceptance criteria so an independent agent can pick it up without prior context.
+
+Conventions enforced by `CLAUDE.md`: terse, vertical-dense, in-line lowercase comments, no auto-refactor outside scope, fail fast, no `[Unverified]` labels inside code.
+
+---
+
+## 0. Orientation
+
+### Repo map (under `/Users/gongahkia/Desktop/coding/projects/fried-apple-pie`)
+- `package.json` — npm + Pi manifest. `pi.extensions: ["./extensions/pie-ui"]`, `pi.skills: ["./skills"]`, `pi.themes: ["./themes"]`. Peer deps: `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`.
+- `extensions/pie-ui/index.ts` — default-exported `(pi: ExtensionAPI) => void`. Subscribes events, registers `/pie` command and `pie_config` tool, calls `applyPie()` on `session_start`. Currently ~445 LOC.
+- `extensions/pie-ui/config.ts` — constants (`PRESET_NAMES`, `FOOTER_SEGMENTS`, `MODE_NAMES`, `PRESET_THEMES`, `PRESETS`), `validateConfig`, `applyJsonPatch`, `materializeConfig`, `mergeConfig`, `applyPresetConfig`, `cloneConfig`.
+- `extensions/pie-ui/paths.ts` — `loadConfig`, `readConfigFile`, `writeConfigFile`, `defaultWritePath`, `resolveWriteTarget`. Global path: `~/.pi/agent/pie-ui.json`. Project path: `<cwd>/.pi/pie-ui.json` (requires `ctx.isProjectTrusted()`).
+- `extensions/pie-ui/render.ts` — `createFooter`, `createHeader`, `widgetLines`, picker overlays (`PresetPicker`, `EditPicker`, `FooterSegmentPicker`, `TextPanel`), footer segment renderer switch (`renderSegment` at `render.ts:315`).
+- `themes/*.json` — 5 themes; every theme must contain 51 color tokens (canonical list at `tests/config.test.ts:12-64`).
+- `schema/pie-ui.schema.json` — JSON Schema. Enums MUST stay in sync with `config.ts` (enforced by test at `tests/config.test.ts:134-145`).
+- `skills/fried-apple-pie/SKILL.md` — agent-facing instructions; update when commands/tool actions change.
+- `tests/config.test.ts` — `node:test` runner via tsx. 14 tests today.
+
+### Build / verify
+- `npm run typecheck` — `tsc --noEmit`.
+- `npm test` — `node --import tsx --test tests/*.test.ts`.
+- `npm run verify` — both.
+- `npm run smoke:pi` — `pi -e . --offline --no-context-files --list-models >/dev/null`.
+- `npm run assets:build` — regenerate gallery PNG/GIF (uses macOS `sips` + ImageMagick `magick`).
+
+### Pi API inventory (canonical: `https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/extensions.md`)
+
+**Used today** (grep `pi.on`, `pi.register*`, `ctx.ui.` in `extensions/pie-ui/`):
+- Events: `resources_discover`, `session_start`, `agent_start`, `agent_end`, `model_select`, `thinking_level_select`, `message_end`.
+- `pi.registerCommand("pie", …)`, `pi.registerTool({ name: "pie_config", … })`, `pi.getCommands`, `pi.getThinkingLevel`.
+- `ctx.ui`: `setTheme`, `setToolsExpanded`, `setHiddenThinkingLabel`, `setWorkingVisible`, `setWorkingMessage`, `setWorkingIndicator`, `setWidget`, `setHeader`, `setFooter`, `notify`, `select`, `input`, `confirm`, `getAllThemes`, `custom`.
+
+**Not yet used** (all verified present in extensions.md):
+- `pi.registerMessageRenderer(customType, (message, opts, theme) => Component)` — per-customType TUI rendering.
+- `pi.registerShortcut(shortcut, { description, handler })` — chord registration.
+- `pi.registerFlag(name, { description, type, default })` — CLI flag.
+- `pi.sendMessage(message, options?)` — inject custom-type message; `delivery` ∈ `"steer" | "followUp" | "nextTurn"`; `triggerTurn?: boolean`.
+- `pi.appendEntry(customType, data?)` — persist state outside LLM context.
+- `pi.events` — inter-extension event bus.
+- `pi.setSessionName`, `pi.setLabel`.
+- `pi.exec(command, args, options?)` — shell exec with signal + timeout.
+- `ctx.ui.setStatus(key, text?)`, `ctx.ui.setTitle`, `ctx.ui.editor`, `ctx.ui.addAutocompleteProvider`, `ctx.ui.setEditorComponent`, `ctx.ui.pasteToEditor`, `ctx.ui.getEditorText`/`setEditorText`.
+- Tool definition `renderCall(args, theme) => Component`, `renderResult(result, opts, theme) => Component`, `renderShell: "self"`.
+- Built-in tool overrides (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`). Renderers and `execute` are independent — omitting either preserves built-in for that slot.
+- `highlightCode`, `getLanguageFromPath`, `keyHint`, `keyText`, `truncateHead`, `truncateTail` utilities from `@earendil-works/pi-tui`.
+- Events not subscribed: `project_trust`, `before_agent_start`, `turn_start`, `turn_end`, `tool_execution_start/update/end`, `tool_call`, `tool_result`, `input`, `user_bash`, `session_before_compact`, `session_compact`, `before_provider_request`, `after_provider_response`, `session_before_switch/fork/tree`.
+
+### Coexistence targets (doctor must detect)
+- `pi-powerline-footer` — owns footer + welcome overlay.
+- `pi-tool-display` — owns tool rendering.
+- `amp-themes` / `@smoose/pi-themes` / `pi-ansi-themes` / `pi-coding-agent-catppuccin` — own theme.
+- `tintinweb/pi-subagents` — fixed Claude Code aesthetic bundled with sub-agent runner.
+
+### Verify-before-promise
+Before relying on any newly-used Pi API call (especially `registerMessageRenderer`, `before_agent_start` payload shape, built-in tool override slots, `pi.events`, `pi.exec`), boot Pi locally with `npm run smoke:pi` and `pi -e .` to confirm runtime shape. Docs are the source of truth but field names occasionally drift.
+
+---
+
+## 1. Tasks
+
+Priority key: **P0** viral lift (high impact, low risk) · **P1** depth · **P2** stickiness · **P3** platform.
+
+Each task is self-contained. Dependencies noted explicitly.
+
+---
+
+### P0-01 — README rewrite for discoverability
+
+- [ ] Rewrite first screen, add comparison table, add migration block, add per-preset gallery.
+
+**Why:** Pi catalog rewards screenshot-rich READMEs. Current `README.md` has one image, no comparison, no migration hook. Highest ROI single change.
+
+**Files:** `README.md`, `assets/` (add per-preset screenshots after P0-02 lands).
+
+**Sketch:**
+- First screen: animated GIF + 1-line hook + install command (`pi install npm:fried-apple-pie`).
+- Section "Migrating from Claude Code / Codex / Gemini / OpenCode / Aider": one-line `pi install … && pi /pie preset <name>`.
+- Comparison table vs `tweakcc`, `pi-powerline-footer`, `amp-themes`, `ccstatusline`, `lualine`, `opencode`. Columns: multi-preset, tool rendering, spinners, thinking verbs, boot ASCII, keybinds registered, conditional segments, persona, capture/share, agent-readable config, trust scope, tests.
+- Per-preset screenshot grid (filled after P0-02).
+- "Why fried-apple-pie": agent-editable config, JSON Patch tool, doctor, compat-mode, trust scope.
+- "Compat": list known footer/widget owners + recommended `mode`.
+
+**Refs:** existing README `README.md:1-117`. Comparison table data lives in TODO §3.
+
+**Acceptance:** Renders all four blocks. Install is ≤3 lines.
+
+---
+
+### P0-02 — `/pie capture` via vhs
+
+- [ ] Add `vhs` tapes, `scripts/capture.sh`, `assets:capture` npm script, `/pie capture` subcommand using `pi.exec`.
+
+**Why:** viral GIFs require deterministic regeneration. `vhs` (Charm) renders `.tape` files into reproducible GIFs.
+
+**Files:** new `assets/tapes/<preset>.tape` (one per preset), new `scripts/capture.sh`, edit `package.json` to add `"assets:capture"` script, edit `extensions/pie-ui/index.ts` to add `capture` subcommand (extend command list in `getArgumentCompletions` at `index.ts:90`).
+
+**Sketch:**
+```sh
+# scripts/capture.sh — runs every tape
+for tape in assets/tapes/*.tape; do vhs "$tape"; done
+```
+Tape template:
+```
+Output assets/preview-<preset>.gif
+Set FontSize 14
+Set Width 1200
+Set Height 740
+Set Theme "Dracula"
+Type "pi /pie preset <preset>" Enter
+Sleep 2s
+Type "list the files in this repo" Enter
+Sleep 6s
+```
+Command handler (in `extensions/pie-ui/index.ts`): write a temp tape with the active preset substituted → `await pi.exec("vhs", [tapePath], { signal: ctx.signal })` → notify with output path.
+
+Doctor must check `vhs`, `ttyd`, `ffmpeg` on PATH; warn if missing.
+
+**Refs:** vhs https://github.com/charmbracelet/vhs · `pi.exec` per extensions.md.
+
+**Acceptance:** `npm run assets:capture` writes one GIF per preset. `/pie capture` writes a GIF for the active preset and notifies the absolute path. `/pie doctor` warns on missing vhs/ttyd/ffmpeg.
+
+---
+
+### P0-03 — `/pie gallery` live cycle overlay
+
+- [ ] Add overlay component that cycles every preset live, restoring original on exit.
+
+**Why:** the 30-second video — scroll through every preset in sequence. Drives screenshot threads.
+
+**Files:** `extensions/pie-ui/render.ts` (new `GalleryCycle` component), `extensions/pie-ui/index.ts` (new `gallery` subcommand).
+
+**Sketch:**
+- Model `GalleryCycle` after `PresetPicker` at `render.ts:138-175`.
+- On open: snapshot current preset.
+- `j`/`k`/`l`/`h`/arrows advance index; on each change call `applyPresetConfig(current, PRESET_NAMES[i], "clean")` → `writeConfigFile` to a transient path OR call `applyPie(ctx, pi, state)` with an in-memory override.
+- `q` / `esc` restores snapshot.
+- Show `<i+1>/<N> · <name>` and a one-line description per preset.
+
+Prefer in-memory override (do not write to user config during cycle). Add `applyPieOverride(ctx, pi, state, override: PieConfig)` helper that bypasses `loadConfig` and passes the override directly through the same setTheme/setFooter/… pipeline used by `applyPie` (`index.ts:130-171`).
+
+**Refs:** `PresetPicker` at `render.ts:138`; `applyPie` at `index.ts:130`.
+
+**Acceptance:** `/pie gallery` opens, arrow keys live-swap, `q` restores. No write to `pie-ui.json` during cycle. Works at terminal widths ≥40 columns.
+
+---
+
+### P0-04 follow-ups (remaining additions)
+
+P0-04 main goal hit (12 presets shipped: 7 cross-agent + 5 theme-only). Remaining optional presets if needed later: `cursor-inspired`, `amp-inspired`, `catppuccin-latte`, `gruvbox-light`. Same shape and acceptance as P0-04; bundle if/when there's demand.
+
+---
+
+### P0-05 — Per-preset spinner + thinking-verb library
+
+- [ ] Vendor ~10 spinner frame sets, ~6 verb packs. Add `persona` field. Bind a default persona per preset. Add `/pie persona` subcommand.
+
+**Why:** `tweakcc` ships 70+ spinners + custom verbs; `pi-powerline-footer` ships AI-generated "vibes". fried-apple-pie's config has `working.frames` / `working.intervalMs` but no library and no per-preset binding.
+
+**Files:**
+- new `extensions/pie-ui/personas.ts` — spinner + verb tables.
+- `extensions/pie-ui/config.ts` — add `persona?: string` top-level field; extend `PRESETS[*].working` with default persona reference.
+- `extensions/pie-ui/index.ts` — apply persona in `applyPie` (`index.ts:130-171`); subscribe `pi.on("turn_start", …)` to rotate `setWorkingMessage` from the verb pack.
+- `schema/pie-ui.schema.json` — `persona: { type: "string" }`.
+
+**Sketch:**
+```ts
+// personas.ts
+export const SPINNERS: Record<string, { frames: string[]; intervalMs: number }> = {
+  dots:  { frames: ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"], intervalMs: 80 },
+  arc:   { frames: ["◜","◠","◝","◞","◡","◟"], intervalMs: 100 },
+  line:  { frames: ["-","\\","|","/"], intervalMs: 130 },
+  arrow: { frames: ["←","↖","↑","↗","→","↘","↓","↙"], intervalMs: 100 },
+  moon:  { frames: ["🌑","🌒","🌓","🌔","🌕","🌖","🌗","🌘"], intervalMs: 80 },
+  // …vendor up to 10 from cli-spinners (MIT)
+};
+export const VERB_PACKS: Record<string, { verbs: string[]; systemPromptSuffix?: string }> = {
+  default:    { verbs: ["Working", "Thinking", "Processing"] },
+  terse:      { verbs: ["Working", "Done"] },
+  startrek:   { verbs: ["Engaging warp drive", "Running diagnostics", "Hailing frequencies"] },
+  medieval:   { verbs: ["Forging", "Conjuring", "Questing"] },
+  pirate:     { verbs: ["Plunderin'", "Hoistin' sails", "Searchin' the seas"] },
+  mlengineer: { verbs: ["Tuning", "Training", "Eval-ing"] },
+};
+export const PRESET_DEFAULT_PERSONA: Record<PresetName, { spinner: string; verbs: string }> = {
+  "minimal":           { spinner: "line", verbs: "terse" },
+  "claude-inspired":   { spinner: "dots", verbs: "default" },
+  "codex-inspired":    { spinner: "arc",  verbs: "terse" },
+  // …
+};
+```
+Apply: in `applyPie`, read `config.persona ?? PRESET_DEFAULT_PERSONA[preset]` → `ctx.ui.setWorkingIndicator(SPINNERS[spinnerName])` and rotate verb index per `turn_start` event.
+
+cli-spinners frames are MIT-licensed; vendor a subset to avoid runtime dep. Source: https://github.com/sindresorhus/cli-spinners/blob/main/spinners.json.
+
+**Refs:** existing `setWorkingIndicator` call at `index.ts:148`; persona system inspired by Claude Code `/output-style`.
+
+**Acceptance:** `/pie persona <name>` switches verbs+spinner without changing preset. `pie-ui.json` persists choice. Each preset declares default persona. `working.message` rotates on each new turn.
+
+---
+
+### P0-06 — Boot ASCII art per preset (`pi.sendMessage` + `registerMessageRenderer`)
+
+- [ ] Add ASCII banner per preset; deliver as a custom-type message at `session_start`.
+
+**Why:** branded welcome moment. pi-powerline-footer's splash is a star magnet. Original art only — no copy from claude/codex/gemini repos.
+
+**Files:**
+- new `extensions/pie-ui/banners.ts` — `BANNERS: Record<PresetName, string[]>`.
+- `extensions/pie-ui/index.ts` — register renderer; send message in `session_start` handler at `index.ts:68-70`.
+- `extensions/pie-ui/config.ts` — new `welcome?: { enabled?: boolean; banner?: string[] }` field.
+- `schema/pie-ui.schema.json` — `welcome` block.
+
+**Sketch:**
+```ts
+pi.registerMessageRenderer("pie:welcome", (message, _opts, theme) => {
+  // return a Component (use truncateToWidth + theme.fg per render.ts patterns)
+  return { invalidate() {}, render(width) { return (message.details as { lines: string[] }).lines.map(l => theme.fg("accent", l)); } };
+});
+pi.on("session_start", (event, ctx) => {
+  applyPie(ctx, pi, state);
+  if (event.reason !== "startup") return; // skip on reload/fork to avoid noise
+  const cfg = loadConfig(ctx.cwd, ctx.isProjectTrusted()).effective;
+  if (cfg.welcome?.enabled === false) return;
+  const lines = cfg.welcome?.banner ?? BANNERS[cfg.preset ?? "minimal"];
+  pi.sendMessage({ customType: "pie:welcome", content: "", display: true, details: { lines } });
+});
+```
+
+`session_start` `event.reason` values: `"startup" | "reload" | "new" | "resume" | "fork"` per extensions.md.
+
+**Refs:** `registerMessageRenderer` signature per extensions.md: `(message, opts, theme) => Component`. Banner shape similar to existing `widgetLines` at `render.ts:61-66`.
+
+**Acceptance:** banner shows at first session start; suppressed on reload/fork; config flag disables. Doctor warns if another extension owns a welcome overlay (detect `pi-powerline-footer` by command presence).
+
+---
+
+### P0-07 — Per-preset tool rendering via `renderCall`/`renderResult`
+
+- [ ] Override built-in `bash`, `edit`, `read`, `grep` renderers with preset-driven styles. Ship one style end-to-end before templating the rest.
+
+**Why:** single largest visual lift. Differentiates from amp-themes (one style) and pi-subagents (fixed Claude style) by switching style per preset. Highest engineering cost; ship one style first to de-risk.
+
+**Files:**
+- new `extensions/pie-ui/tool-renderers.ts` — style implementations.
+- `extensions/pie-ui/index.ts` — register tool overrides in addition to `pie_config`.
+- `extensions/pie-ui/config.ts` — extend `tools?: { expanded?: boolean; renderStyle?: "pill" | "card" | "dense" | "minimal" }`.
+- `extensions/pie-ui/render.ts` — shared helpers if needed.
+- `schema/pie-ui.schema.json` — extend `tools` properties.
+
+**Sketch:**
+```ts
+// tool-renderers.ts
+export type ToolRenderStyle = "pill" | "card" | "dense" | "minimal";
+import type { Component } from "@earendil-works/pi-tui";
+
+export function renderToolCall(style: ToolRenderStyle, name: string, args: unknown, theme: ThemeLike): Component { /* … */ }
+export function renderToolResult(style: ToolRenderStyle, name: string, result: { content: { type: "text"; text: string }[]; details?: unknown }, opts: { expanded: boolean }, theme: ThemeLike): Component { /* … */ }
+```
+Built-in override (extensions.md confirms renderers and `execute` are independent — omit `execute` to keep built-in):
+```ts
+for (const name of ["bash", "edit", "read", "grep"] as const) {
+  pi.registerTool({
+    name,
+    label: name,
+    description: "", // built-in
+    parameters: Type.Any(),
+    renderCall:   (args, theme)        => renderToolCall  (currentStyle(), name, args, theme),
+    renderResult: (result, opts, theme) => renderToolResult(currentStyle(), name, result, opts, theme),
+    // execute omitted -> built-in execute preserved
+  });
+}
+```
+
+`currentStyle()` reads cached `applyPie` config — store the last-applied style in module-scope state (similar to `RenderState`).
+
+Build one style at a time:
+1. Start with `dense` for `codex-inspired` (single-row header, inline diff).
+2. Add `pill` for `claude-inspired` (compact pill chips).
+3. Add `card` for `gemini-inspired` (bordered card with metadata).
+4. Add `minimal` for `minimal` and `aider-inspired`.
+
+**Refs:**
+- extensions.md §"Built-in Tool Override Details" — confirms slots independent.
+- `truncateHead`, `truncateTail`, `highlightCode`, `getLanguageFromPath`, `keyHint` from `@earendil-works/pi-tui`.
+- amp-themes for "Amp-style tool rendering" precedent (do not copy code).
+
+**Risks:** built-in tool override semantics need empirical verification — register only renderers (no `execute`) and confirm `bash`/`edit`/`read`/`grep` still run normally via `npm run smoke:pi` + manual `pi -e .` smoke. If override mode silently disables execute, fall back to wrapping output by listening on `tool_result` event and rendering via `setWidget` (less elegant).
+
+**Acceptance:** switching presets visibly changes tool-call rendering. 4 styles ship. Each preset declares its style. Built-in tool behavior (success/error/output) unchanged.
+
+---
+
+### P1-08 — Keybindings via `pi.registerShortcut` with leader prefix
+
+- [ ] Register `ctrl+p` leader chord plus `p/g/s/e/d/c` follow-ups. Document rebind path.
+
+**Why:** parity with `pi-powerline-footer` (alt+s, ctrl+shift+b). Zero shortcuts today.
+
+**Files:** `extensions/pie-ui/index.ts` (add `pi.registerShortcut` block alongside `registerCommand`). README + SKILL.md updates.
+
+**Sketch:**
+```ts
+pi.registerShortcut("ctrl+p p", { description: "Fried Apple Pie: preset picker",   handler: async (ctx) => { /* call pickPreset + writePreset */ } });
+pi.registerShortcut("ctrl+p g", { description: "Fried Apple Pie: gallery cycle",   handler: async (ctx) => { /* P0-03 entry */ } });
+pi.registerShortcut("ctrl+p s", { description: "Fried Apple Pie: footer segments", handler: async (ctx) => { /* pickFooterSegments */ } });
+pi.registerShortcut("ctrl+p e", { description: "Fried Apple Pie: edit",            handler: async (ctx) => { /* editConfig */ } });
+pi.registerShortcut("ctrl+p d", { description: "Fried Apple Pie: doctor",          handler: async (ctx) => { /* doctorLines panel */ } });
+pi.registerShortcut("ctrl+p c", { description: "Fried Apple Pie: capture",         handler: async (ctx) => { /* P0-02 entry */ } });
+```
+
+Rebind path (document in README): `~/.pi/agent/keybindings.json` — per keybindings.md https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/keybindings.md. After editing, run `/reload` in Pi.
+
+**Refs:** keybindings.md.
+
+**Acceptance:** all six shortcuts work; README documents rebind; doctor lists active chords.
+
+---
+
+### P1-09 — Conditional footer segments
+
+- [ ] Segment shape becomes `string | { id: FooterSegment; when?: WhenRule }`. Backward compatible (bare strings).
+
+**Why:** lualine parity. `branch` already returns `undefined` outside git repos (`render.ts:319-322`); generalize.
+
+**Files:**
+- `extensions/pie-ui/config.ts` — segment union type, validator update.
+- `extensions/pie-ui/render.ts` — filter at `createFooter` (`render.ts:34-44`) or per-segment in `renderSegment` (`render.ts:315`).
+- `schema/pie-ui.schema.json` — `segments.items` becomes union.
+- `tests/config.test.ts` — add tests.
+
+**Sketch:**
+```ts
+type WhenRule = "always" | "git-repo" | "trusted-project" | "context>50" | "context>70" | "context>90" | "tokens>10k";
+type SegmentEntry = FooterSegment | { id: FooterSegment; when?: WhenRule };
+function shouldRender(rule: WhenRule | undefined, ctx, footerData): boolean { /* … */ }
+```
+Existing `branch` short-circuit at `render.ts:320-322` can be removed once `{ id: "branch", when: "git-repo" }` is in default presets.
+
+**Refs:** existing `renderSegment` switch at `render.ts:315`.
+
+**Acceptance:** `{ id: "cost", when: "context>70" }` only renders when usage > 70%. New tests cover each rule. Bare-string config keeps working.
+
+---
+
+### P1-10 — Layer composition (Doom-modules pattern)
+
+- [ ] `layers: string[]` field that resolves additional partial configs between preset and user overrides.
+
+**Why:** power-user mental model. Users compose `theme:codex + footer:powerline + welcome:claude`.
+
+**Files:** new `extensions/pie-ui/layers/` dir + `extensions/pie-ui/layers.ts` registry. Extend `config.ts` `materializeConfig` (`config.ts:218-221`). Update schema + tests.
+
+**Sketch:**
+- Bundled layers (each a partial `PieConfig`): `theme:codex`, `theme:gemini`, `theme:claude`, `theme:opencode`, `footer:powerline`, `footer:minimal`, `footer:dense`, `welcome:claude`, `welcome:none`, `tools:pill`, `tools:dense`, `persona:terse`, `persona:startrek`.
+- Resolve order: `DEFAULT_CONFIG` → `PRESETS[preset]` → `layers[0..n]` → user raw config.
+- Validation rejects unknown layer ids in strict mode; warns in default.
+- Doctor lists active layers.
+
+**Acceptance:** `{ preset: "codex-inspired", layers: ["theme:gemini", "footer:powerline"] }` produces a config combining all three. Tests cover order + unknown-layer rejection.
+
+---
+
+### P1-11 — `/pie share` to static registry
+
+- [ ] Subcommand that bundles current effective config + screenshot into a shareable payload.
+
+**Why:** community flywheel. Users export their config, others install via slug.
+
+**Files:** `extensions/pie-ui/index.ts` (subcommand), new `docs/registry.md` describing protocol, optional `scripts/share.sh`.
+
+**Sketch (MVP, server-stub):**
+- `/pie share` writes `pie-ui.json` + latest screenshot to `assets/share/<timestamp>/`.
+- `pi.exec("curl", ["-fsSL", "-X", "POST", "https://fried-apple-pie.dev/api/share", "-d@-"], { input: payload })` — server returns slug; if unreachable, fall back to printing local files and a `gh gist create` command suggestion.
+- Doc `docs/registry.md` defines payload schema (`{ config, screenshotPath, author, version, timestamp }`) and `pi install fap:<slug>` resolution behaviour for a future Pi-side resolver.
+
+**Refs:** `pi.exec` per extensions.md. `pi install` resolves `npm:` and git URLs per packages.md; custom protocols would need Pi-side hook.
+
+**Acceptance:** command works offline (prints fallback). Server-side optional. `docs/registry.md` documents protocol.
+
+---
+
+### P1-12 — CLI flag `pi --pie-preset=<name>`
+
+- [ ] Register a flag for one-shot launches into a preset without writing config.
+
+**Why:** blog tutorials and demo videos.
+
+**Files:** `extensions/pie-ui/index.ts`.
+
+**Sketch:**
+```ts
+pi.registerFlag("pie-preset", { description: "Apply Fried Apple Pie preset on launch", type: "string", default: "" });
+
+pi.on("session_start", (_event, ctx) => {
+  const flag = pi.getFlag?.("pie-preset"); // verify retrieval API name with smoke test
+  if (flag && PRESET_NAMES.includes(flag as PresetName)) {
+    state.transientPreset = flag as PresetName;
+  }
+  applyPie(ctx, pi, state);
+});
+```
+Transient preset: skip write to `pie-ui.json`; pass as override into `applyPie` (see P0-03 `applyPieOverride`).
+
+**Refs:** extensions.md `pi.registerFlag` — verify exact retrieval API (`pi.getFlag` vs flag-as-arg) with smoke test before relying on it.
+
+**Acceptance:** `pi --pie-preset codex-inspired -e .` boots into preset; nothing written to disk.
+
+---
+
+### P1-13 — Coexistence `status-only` mode
+
+- [ ] New mode that skips header/footer/widget ownership and uses `ctx.ui.setStatus` instead.
+
+**Why:** doctor currently flags conflicts but offers no compromise. `setStatus` is the small non-owning surface.
+
+**Files:** `extensions/pie-ui/config.ts` (`MODE_NAMES` add `status-only`), `extensions/pie-ui/index.ts` (`applyPie` `index.ts:130-171` branch), `schema/pie-ui.schema.json`, tests.
+
+**Sketch:** in `applyPie`, if `mode === "status-only"`:
+- Skip `setHeader`/`setFooter`/`setWidget`.
+- `ctx.ui.setStatus("fried-apple-pie", \`${cfg.preset ?? "custom"} · ctx ${contextLeft(ctx, true)}\`)`.
+- Reapply on `turn_end` / `message_end`.
+- On detach: `ctx.ui.setStatus("fried-apple-pie")` (no text clears).
+
+Doctor: when `pi-powerline-footer` (or any extension owning `setFooter`) is detected, recommend `mode: status-only`.
+
+**Refs:** extensions.md `ctx.ui.setStatus`.
+
+**Acceptance:** with `pi-powerline-footer` installed and `mode: status-only`, fried-apple-pie still shows preset + ctx without conflict. Test asserts no `setHeader`/`setFooter` calls in `status-only`.
+
+---
+
+### P1-14 — Context-aware notify on `turn_end`
+
+- [ ] Subscribe to `turn_end`; warn at 70% and 90% context usage; one-shot per session.
+
+**Why:** pi-powerline-footer parity.
+
+**Files:** `extensions/pie-ui/index.ts`.
+
+**Sketch:**
+```ts
+const warned: { mid: boolean; high: boolean } = { mid: false, high: false };
+pi.on("turn_end", (_event, ctx) => {
+  if (loaded.effective.notifications?.contextWarnings === false) return;
+  const usage = ctx.getContextUsage();
+  if (!usage?.percent) return;
+  if (usage.percent >= 90 && !warned.high) { ctx.ui.notify("Context >90%. Consider /compact.", "warning"); warned.high = true; }
+  else if (usage.percent >= 70 && !warned.mid) { ctx.ui.notify("Context >70%.", "info"); warned.mid = true; }
+});
+pi.on("session_compact", () => { warned.mid = false; warned.high = false; });
+```
+Add config block `notifications?: { contextWarnings?: boolean }` + schema.
+
+**Acceptance:** warnings fire once each threshold per session. Opt-out via config. Reset after `/compact`.
+
+---
+
+### P1-15 — Persona system prompt suffix (orthogonal axis)
+
+Depends on P0-05.
+
+- [ ] Each persona may carry a `systemPromptSuffix`. Applied via `before_agent_start`.
+
+**Why:** Claude Code `/output-style` proved demand for instant personality changes that affect agent tone.
+
+**Files:** `extensions/pie-ui/personas.ts` (extend `VERB_PACKS` shape), `extensions/pie-ui/index.ts` (subscribe `before_agent_start`).
+
+**Sketch:**
+```ts
+pi.on("before_agent_start", (event, ctx) => {
+  const persona = currentVerbPack();
+  if (!persona?.systemPromptSuffix) return;
+  event.messages.unshift({ role: "system", content: persona.systemPromptSuffix });
+});
+```
+Verify `event.messages` field name + mutability via smoke test before relying. extensions.md describes the event as "inject messages, modify system prompt" but exact field shape requires runtime confirmation.
+
+**Acceptance:** `/pie persona terse` shortens verbs + adds "respond tersely, omit preamble" suffix; `/pie persona vibes-startrek` only changes verbs.
+
+---
+
+### P2-16 — `/pie diff <preset>` preview
+
+- [ ] Show keys that would change between current effective and target preset's clean apply.
+
+**Files:** `extensions/pie-ui/index.ts` (subcommand), `extensions/pie-ui/render.ts` (reuse `showPanel` at `render.ts:119`).
+
+**Sketch:** compare current effective vs `applyPresetConfig(current, target, "clean")` and `materializeConfig(...)`. Render side-by-side keys. Use the existing `summarizeChange` helper at `index.ts:383-389` as a starting point — generalize to multi-line diff.
+
+**Acceptance:** `/pie diff codex-inspired` shows changed keys before any write.
+
+---
+
+### P2-17 — `/pie history` + `/pie undo` via `pi.appendEntry`
+
+- [ ] Persist preset changes; allow rollback to previous.
+
+**Files:** `extensions/pie-ui/index.ts` (subcommands + `writePreset` hook at `index.ts:229-236`).
+
+**Sketch:**
+```ts
+// in writePreset, before applyPie:
+pi.appendEntry("pie:history", { previous: current, next, ts: Date.now() });
+```
+`/pie history`: read entries via `ctx.sessionManager.getBranch?.()` filtered by `customType === "pie:history"`, render last 10.
+`/pie undo`: pop most recent entry, `writeConfigFile` previous value.
+
+**Refs:** `pi.appendEntry` per extensions.md; `ctx.sessionManager.getBranch?.()` already used at `render.ts:350`.
+
+**Acceptance:** undo restores previous state; history shows ≥1 entry after first switch.
+
+---
+
+### P2-18 — `/pie import <url|file>`
+
+- [ ] Read remote JSON (curl via `pi.exec`) or local file → validate → write to chosen scope.
+
+**Files:** `extensions/pie-ui/index.ts`.
+
+**Sketch:** detect `https?://` prefix → `pi.exec("curl", ["-fsSL", url])`; otherwise `readFileSync`. Validate via `validateConfig`. Confirm with `ctx.ui.confirm` listing change summary. Write via existing `chooseWriteTarget` at `index.ts:370-381`.
+
+**Acceptance:** valid imports applied; invalid rejected with reason; user can choose global or project scope.
+
+---
+
+### P2-19 — Inline `ctx.ui.editor` config edit + autocomplete
+
+- [ ] `/pie edit-json` opens multi-line editor seeded with current effective config; autocomplete for known keys/enums.
+
+**Files:** `extensions/pie-ui/index.ts` (subcommand + `addAutocompleteProvider`).
+
+**Sketch:**
+```ts
+const text = await ctx.ui.editor("Fried Apple Pie config", JSON.stringify(loaded.effective, null, 2));
+if (!text) return;
+const parsed = JSON.parse(text);
+const v = validateConfig(parsed);
+if (!v.valid) { ctx.ui.notify(`Invalid: ${v.errors[0]}`, "error"); return; }
+const target = await chooseWriteTarget(ctx);
+if (target) { writeConfigFile(target.path, parsed); applyPie(ctx, pi, state); }
+```
+Autocomplete provider matches when text contains `pie-ui.json`-relevant patterns (`"preset":`, `"mode":`, etc.) and returns enums from `PRESET_NAMES`, `MODE_NAMES`, `FOOTER_SEGMENTS`.
+
+**Refs:** `ctx.ui.editor`, `ctx.ui.addAutocompleteProvider` per extensions.md.
+
+**Acceptance:** editing in TUI, saving applies live; autocomplete suggests enum values.
+
+---
+
+### P2-20 — `pi.events` emit on preset/mode change
+
+- [ ] Emit `pie:preset-changed`, `pie:mode-changed`, `pie:persona-changed` for companion extensions.
+
+**Files:** `extensions/pie-ui/index.ts` (`writePreset`, `writeMode`, persona setter), SKILL.md documenting events.
+
+**Sketch:**
+```ts
+pi.events?.emit?.("pie:preset-changed", { from, to });
+```
+Use optional chaining defensively until event-bus shape is empirically confirmed.
+
+**Acceptance:** event emitted on each setter; SKILL.md documents schema.
+
+---
+
+### P2-21 — Screenshot CI workflow
+
+Depends on P0-02.
+
+- [ ] GH Action runs every `assets/tapes/*.tape`, uploads GIFs as artifacts, commits to `screenshots` branch on `main`.
+
+**Files:** `.github/workflows/screenshots.yml`.
+
+**Sketch:**
+```yaml
+name: screenshots
+on: [push, pull_request]
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - run: npm ci
+      - run: npm run verify
+      - uses: charmbracelet/vhs-action@v2
+        with: { path: "assets/tapes" }
+      - uses: actions/upload-artifact@v4
+        with: { name: previews, path: "assets/preview-*.gif" }
+```
+
+**Refs:** vhs-action: https://github.com/charmbracelet/vhs-action.
+
+**Acceptance:** PRs get artifact GIFs; pushes to main update `screenshots` branch (or replace `assets/preview-*.gif` directly if preferred).
+
+---
+
+### P2-22 — AGENTS.md for cross-agent friendliness
+
+- [ ] Add `AGENTS.md` at repo root teaching other agents (Claude Code, Codex via MCP) to read `pie_config` first.
+
+**Files:** new `AGENTS.md`.
+
+**Sketch:** 1-page summary: project purpose, `pie_config` tool actions, common workflows ("switch preset", "patch footer segments", "validate"), pointers to schema and SKILL.md.
+
+**Acceptance:** file exists; Pi catalog and Claude Code marketplaces auto-index it.
+
+---
+
+### P3-23 — Preset SDK for third-party packages
+
+- [ ] Export `defineFriedApplePiePreset(...)` so others can publish presets that depend on this package.
+
+**Files:** new `extensions/pie-ui/sdk.ts`, `package.json` `exports` map.
+
+**Sketch:**
+```ts
+export type PresetDefinition = {
+  name: string;
+  theme: ThemeFile;            // 51-token JSON shape
+  config: Partial<PieConfig>;
+  banner?: string[];
+  persona?: { spinner: string; verbs: string };
+};
+export function defineFriedApplePiePreset(spec: PresetDefinition): PresetDefinition { return spec; }
+```
+Third-party packages depend on `fried-apple-pie`, export a default `PresetDefinition`, Pi discovers via `pi.themes` and `pi.extensions` (host extension can scan loaded extensions for `__friedApplePiePreset` markers).
+
+**Refs:** lualine-themes ecosystem for ergonomic precedent.
+
+**Acceptance:** README "Authoring presets" section; example package stub in `examples/`.
+
+---
+
+### P3-24 — Theme-extraction CLI `npx fap capture-terminal`
+
+- [ ] Read terminal OSC color responses, emit a Pi-compatible 51-token theme JSON.
+
+**Files:** new `bin/fap-capture-terminal.ts`, `package.json` `bin: { fap: "./bin/fap-capture-terminal.ts" }` (or compiled JS).
+
+**Sketch:**
+- Use OSC 4 queries (`\x1b]4;<idx>;?\x07`) for ANSI 0-15. Read response from stdin within timeout.
+- Map ANSI → 51 tokens via heuristic similar to `leblancfg/pi-ansi-themes`:
+  - ANSI 1=error, 2=success, 3=warning, 4=accent2, 5=accent, 6=accent2, 7=text, 8=dim.
+  - Backgrounds (`*Bg`) from terminal default bg.
+- Write `themes/<name>.json` with `{ $schema, name, vars, colors }`.
+
+**Refs:** leblancfg/pi-ansi-themes for ANSI-mapping precedent: https://github.com/leblancfg/pi-ansi-themes.
+
+**Acceptance:** `npx fap capture-terminal --name my-theme` writes a valid 51-token theme. `npm test` passes against generated files.
+
+---
+
+### P3-25 — Web playground stub
+
+- [ ] Define scope of a live HTML preview site for presets. Implementation is out of this repo.
+
+**Files:** new `docs/playground.md`.
+
+**Sketch:** doc covers data flow (read `themes/*.json` and `PRESETS` constant at build time, render TUI mock in HTML), hosting suggestion (GitHub Pages), and link-back to install command.
+
+**Acceptance:** doc lists requirements and acceptance for a future implementation.
+
+---
+
+### P3-26 — Telemetry-free opt-in stats
+
+- [ ] Anonymized POST to registry when user opts in. Defaults off.
+
+**Files:** new `extensions/pie-ui/stats.ts`. Config extension. Doctor reporting.
+
+**Sketch:** opt-in flag `analytics.enabled: true`. POST `{ preset, persona, layers, hashedInstallId: sha256(homedir + machineId).slice(0,16) }` once per session. No IP capture beyond what the HTTP server logs.
+
+**Acceptance:** opt-out by default; flag toggleable via `/pie edit`; doctor reports state.
+
+---
+
+## 2. Cross-cutting hygiene (always)
+
+- [ ] **CC-01** Update `skills/fried-apple-pie/SKILL.md` whenever a new command/subcommand/tool action is added so the Pi agent can drive it.
+- [ ] **CC-02** Keep `schema/pie-ui.schema.json` enums in sync with `extensions/pie-ui/config.ts` constants. Test at `tests/config.test.ts:134-145` enforces.
+- [ ] **CC-03** All themes must include 51 tokens (canonical list `tests/config.test.ts:12-64`). Tests enforce token completeness (`:119-125`) and preset↔theme mapping (`:112-117`).
+- [ ] **CC-04** Verify each new Pi API call with `npm run smoke:pi` and a manual `pi -e .` run before promising it. Docs are authoritative but field shapes occasionally drift.
+- [ ] **CC-05** Before adding any new event subscription, confirm event payload shape in a smoke test — extensions.md lists handlers but not always every field name.
+
+---
+
+## 3. Comparative reference (for prioritization context)
+
+| Surface | fried-apple-pie | tweakcc (CC) | amp-themes (Pi) | pi-powerline-footer | ccstatusline (CC) | lualine (nvim) | opencode |
+|---|---|---|---|---|---|---|---|
+| Multi-preset switch | **12** | — | — | — | scripted | themes | themes |
+| Tool rendering | expand-only | — | pills/cards | — | — | n/a | — |
+| Spinners | frames only | **70+** | — | — | — | n/a | n/a |
+| Thinking verbs | static label | **custom lib** | — | AI "vibes" | — | n/a | n/a |
+| Boot/welcome ASCII | title+subtitle | sign-in ASCII | — | **branded splash + stats** | — | winbar | — |
+| User-msg styling | theme | **per element** | compact | — | n/a | n/a | n/a |
+| Markdown styling | — | **yes** | partial | — | n/a | n/a | n/a |
+| Keybinds registered | — | — | — | **alt+s, ctrl+shift+b** | — | n/a | yes |
+| Conditional segments | — | n/a | n/a | context-warn | flexible | **richest** | — |
+| Sticky bash | — | — | — | yes | — | n/a | n/a |
+| Recent-prompts overlay | — | — | — | yes (50) | — | n/a | n/a |
+| Persona / output-style | — | — | — | working-vibes | — | n/a | n/a |
+| Capture / share | — | — | — | — | — | n/a | n/a |
+| Doctor / conflict check | **unique** | — | — | — | — | n/a | — |
+| Agent-readable config | **unique** | — | — | — | — | n/a | — |
+| JSON Patch agent API | **unique** | — | — | — | — | n/a | — |
+| Trust scope | global+project | — | — | — | yes | n/a | yes |
+| Tests shipped | **yes** | partial | — | — | — | yes | — |
+
+---
+
+## 4. Reference index
+
+- Pi extensions canonical: https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/extensions.md
+- Pi keybindings: https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/keybindings.md
+- Pi themes (51-token schema): https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/themes.md
+- Pi packages: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md
+- Pi catalog: https://pi.dev/packages
+- vhs (CLI recorder): https://github.com/charmbracelet/vhs
+- vhs-action (CI): https://github.com/charmbracelet/vhs-action
+- cli-spinners (MIT, vendorable): https://github.com/sindresorhus/cli-spinners
+- tweakcc (Claude Code customization parity bar): https://github.com/Piebald-AI/tweakcc
+- pi-powerline-footer (Pi feature parity reference): https://github.com/nicobailon/pi-powerline-footer
+- amp-themes (Pi tool-rendering precedent): https://pi.dev/packages/amp-themes
+- tintinweb/pi-subagents (collision-watch target): https://github.com/tintinweb/pi-subagents
+- Claude Code statusline: https://code.claude.com/docs/en/statusline
+- ccstatusline: https://github.com/sirmalloc/ccstatusline
+- lualine.nvim: https://github.com/nvim-lualine/lualine.nvim
+- OpenCode config: https://opencode.ai/docs/config/
+- OpenCode themes: https://opencode.ai/docs/themes/
+- leblancfg/pi-ansi-themes (ANSI-only theme pattern): https://github.com/leblancfg/pi-ansi-themes
+- otahontas/pi-coding-agent-catppuccin: https://github.com/otahontas/pi-coding-agent-catppuccin
+- catppuccin palette: https://github.com/catppuccin/catppuccin
+- tokyo-night palette: https://github.com/folke/tokyonight.nvim
+- nord palette: https://www.nordtheme.com
+- gruvbox palette: https://github.com/morhetz/gruvbox
+- dracula: https://draculatheme.com
+
+---
+
+## 5. Order-of-operations recommendation
+
+Suggested sequence to balance viral demo and depth without half-finished work:
+
+1. ~~P0-04 (12+ presets)~~ — done.
+2. P0-02 (`/pie capture` + vhs) — produces deterministic GIFs for the 12 presets.
+3. P0-03 (`/pie gallery`) — uses the 12 presets. The 30-second video.
+4. P0-01 (README rewrite) — uses outputs from P0-02+03.
+5. P0-05 (personas) — orthogonal axis ships next.
+6. P0-06 (boot ASCII) — needs `registerMessageRenderer`; lower complexity.
+7. P0-07 (per-preset tool rendering) — biggest engineering cost; ship one style end-to-end first (codex-inspired, dense).
+8. P1-08 → P1-15 in parallel.
+9. P2 / P3 as bandwidth allows.
+
+[Inference] This sequence ships visible artifacts every 1–2 days for the first week, which matches the viral-first signal from the project intent.
